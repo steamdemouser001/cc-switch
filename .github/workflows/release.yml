@@ -60,49 +60,50 @@ jobs:
       - name: Prepare Tauri signing key
         shell: bash
         run: |
-          RAW=”${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}”
-          # Secret not set or empty → skip signing, build without it
-          if [ -z “$RAW” ]; then
-            echo “::warning::TAURI_SIGNING_PRIVATE_KEY secret is not set, skipping code signing”
+          RAW="${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}"
+          if [ -z "$RAW" ]; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY secret is not set, skipping code signing"
             exit 0
           fi
 
-          KEY_PATH=”$RUNNER_TEMP/tauri_signing.key”
-          FIRST_LINE=$(printf '%s' “$RAW” | head -n1)
-          case “$FIRST_LINE” in
-            “untrusted comment:”*)
-              printf '%s\n' “$RAW” > “$KEY_PATH”
-              echo “Using raw two-line key format”
+          KEY_PATH="$RUNNER_TEMP/tauri_signing.key"
+          FIRST_LINE=$(printf '%s' "$RAW" | head -n1)
+          case "$FIRST_LINE" in
+            "untrusted comment:"*)
+              printf '%s\n' "$RAW" > "$KEY_PATH"
+              echo "Using raw two-line key format"
               ;;
             *)
-              if DECODED=$(printf '%s' “$RAW” | base64 --decode 2>/dev/null) && \
-                 printf '%s' “$DECODED” | head -n1 | grep -q '^untrusted comment:'; then
-                printf '%s\n' “$DECODED” > “$KEY_PATH”
-                echo “Successfully decoded base64-wrapped key”
-              elif printf '%s' “$RAW” | grep -Eq '^[A-Za-z0-9+/=]+$'; then
-                ONE=$(printf '%s' “$RAW” | tr -d '\r\n')
-                printf '%s\n%s\n' “untrusted comment: tauri signing key” “$ONE” > “$KEY_PATH”
-                echo “Constructed two-line key from single-line base64”
+              if DECODED=$(printf '%s' "$RAW" | base64 --decode 2>/dev/null) && \
+                 printf '%s' "$DECODED" | head -n1 | grep -q "^untrusted comment:"; then
+                printf '%s\n' "$DECODED" > "$KEY_PATH"
+                echo "Successfully decoded base64-wrapped key"
+              elif printf '%s' "$RAW" | grep -Eq '^[A-Za-z0-9+/=]+$'; then
+                ONE=$(printf '%s' "$RAW" | tr -d '\r\n')
+                printf '%s\n%s\n' "untrusted comment: tauri signing key" "$ONE" > "$KEY_PATH"
+                echo "Constructed two-line key from single-line base64"
               else
-                echo “::error::TAURI_SIGNING_PRIVATE_KEY format not recognized”
+                echo "::error::TAURI_SIGNING_PRIVATE_KEY format not recognized"
                 exit 1
               fi
               ;;
           esac
 
-          KEY_B64=$(base64 -w0 < “$KEY_PATH” 2>/dev/null || base64 < “$KEY_PATH” | tr -d '\r\n' || \
-            node -e “process.stdout.write(require('fs').readFileSync('$KEY_PATH').toString('base64'))”)
-          if [ -z “$KEY_B64” ]; then
-            echo “::error::Failed to encode signing key to base64”
+          KEY_B64=$(base64 -w0 < "$KEY_PATH" 2>/dev/null || base64 < "$KEY_PATH" | tr -d '\r\n')
+          if [ -z "$KEY_B64" ]; then
+            KEY_B64=$(node -e "process.stdout.write(require('fs').readFileSync('$KEY_PATH').toString('base64'))")
+          fi
+          if [ -z "$KEY_B64" ]; then
+            echo "::error::Failed to encode signing key to base64"
             exit 1
           fi
-          echo “TAURI_SIGNING_PRIVATE_KEY=$KEY_B64” >> “$GITHUB_ENV”
+          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
 
-          PASS=”${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}”
-          if [ -n “$PASS” ]; then
-            echo “TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$PASS” >> “$GITHUB_ENV”
+          PASS="${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}"
+          if [ -n "$PASS" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$PASS" >> "$GITHUB_ENV"
           fi
-          echo “Tauri signing key prepared”
+          echo "Tauri signing key prepared"
 
       - name: Build Tauri App (Windows)
         if: runner.os == 'Windows'
