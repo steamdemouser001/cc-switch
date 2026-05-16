@@ -154,7 +154,6 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         let mut has_emitted_message_delta = false;
         let mut pending_message_delta: Option<(Option<String>, Option<Value>)> = None;
         let mut has_sent_message_stop = false;
-        let mut accumulated_reasoning = String::new();
         let mut stream_ended_with_error = false;
         let mut latest_usage: Option<Value> = None;
         let mut current_non_tool_block_type: Option<&'static str> = None;
@@ -189,10 +188,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                     }
 
                                     let event = json!({
-                                        "type": "message_stop",
-                                        "metadata": {
-                                            "reasoning_content": accumulated_reasoning
-                                        }
+                                        "type": "message_stop"
                                     });
                                     let sse_data = format!("event: message_stop\ndata: {}\n\n",
                                         serde_json::to_string(&event).unwrap_or_default());
@@ -296,7 +292,6 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                     serde_json::to_string(&event).unwrap_or_default());
                                                 yield Ok(Bytes::from(sse_data));
                                             }
-                                            accumulated_reasoning.push_str(reasoning);
                                         }
 
                                         // 处理文本内容
@@ -649,10 +644,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
             if emitted_pending_message_delta && !has_sent_message_stop {
                 let event = json!({
-                    "type": "message_stop",
-                    "metadata": {
-                        "reasoning_content": accumulated_reasoning
-                    }
+                    "type": "message_stop"
                 });
                 let sse_data = format!("event: message_stop\ndata: {}\n\n",
                     serde_json::to_string(&event).unwrap_or_default());
