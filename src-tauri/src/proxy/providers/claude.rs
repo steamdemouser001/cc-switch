@@ -16,7 +16,7 @@
 
 use super::codex_oauth_auth::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
 use super::{AuthInfo, AuthStrategy, ProviderAdapter, ProviderType};
-use crate::provider::Provider;
+use crate::provider::{ClaudeChatReasoningConfig, Provider};
 use crate::proxy::error::ProxyError;
 use serde_json::{json, Value};
 
@@ -336,6 +336,19 @@ fn should_preserve_reasoning_content_for_openai_chat(provider: &Provider, body: 
         .any(is_reasoning_vendor_identifier)
 }
 
+/// Provider 级推理能力声明（`meta.claudeChatReasoning`）。
+///
+/// Claude → OpenAI Chat 路径原先只用模型名白名单决定是否写 `reasoning_effort`；
+/// 网关背后映射出的上游模型名（如 `deepseek-v4.1-flash`）不在白名单里，客户端发来的
+/// `output_config.effort` 会被静默丢弃，上游只能跑自己的默认档。provider 声明
+/// `supportsEffort` 后以声明为准，不再依赖模型名。
+fn resolve_claude_chat_reasoning_config(provider: &Provider) -> Option<ClaudeChatReasoningConfig> {
+    provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.claude_chat_reasoning.clone())
+}
+
 pub fn transform_claude_request_for_api_format(
     body: serde_json::Value,
     provider: &Provider,
@@ -424,10 +437,13 @@ pub fn transform_claude_request_for_api_format(
         "openai_chat" => {
             let preserve_reasoning_content =
                 should_preserve_reasoning_content_for_openai_chat(provider, &body);
-            let mut result = super::transform::anthropic_to_openai_with_reasoning_content(
-                body,
-                preserve_reasoning_content,
-            )?;
+            let reasoning_config = resolve_claude_chat_reasoning_config(provider);
+            let mut result =
+                super::transform::anthropic_to_openai_with_reasoning_content_and_effort(
+                    body,
+                    preserve_reasoning_content,
+                    reasoning_config.as_ref(),
+                )?;
             // Inject prompt_cache_key only if explicitly configured in meta
             if let Some(key) = provider
                 .meta

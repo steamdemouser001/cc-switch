@@ -4,6 +4,8 @@
 //! 参考: anthropic-proxy-rs
 
 use super::inline_think::split_leading_think_block;
+use super::transform_codex_chat::map_reasoning_effort;
+use crate::provider::ClaudeChatReasoningConfig;
 use crate::proxy::{
     error::ProxyError,
     json_canonical::canonical_json_string,
@@ -156,7 +158,11 @@ fn resolve_requested_reasoning_effort(body: &Value, model: &str) -> Option<&'sta
         };
     }
 
-    // --- Priority 2: thinking.type + budget_tokens fallback ---
+    resolve_thinking_fallback_effort(body)
+}
+
+/// `thinking.type` + `budget_tokens` 回退解析（与模型名无关）。
+fn resolve_thinking_fallback_effort(body: &Value) -> Option<&'static str> {
     let thinking = body.get("thinking")?;
     match thinking.get("type").and_then(|t| t.as_str()) {
         Some("adaptive") => Some("xhigh"),
@@ -170,6 +176,72 @@ fn resolve_requested_reasoning_effort(body: &Value, model: &str) -> Option<&'sta
             }
         }
         _ => None, // disabled or missing
+    }
+}
+
+/// 客户端请求的**原始** effort 档位，不经模型名白名单钳制。
+///
+/// 与 [`resolve_requested_reasoning_effort`] 的差别只在 `output_config.effort`：
+/// `max` 原样保留（不因模型不在 [`supports_max_reasoning_effort`] 里而降成 `xhigh`），
+/// 因为 provider 声明路径的档位合法性由上游能力决定，不由模型名猜。thinking 关闭时
+/// 掉到最低档、以及 `thinking` 回退解析，都与白名单路径共用同一语义。
+fn resolve_requested_effort_verbatim(body: &Value) -> Option<String> {
+    if let Some(effort) = body
+        .pointer("/output_config/effort")
+        .and_then(|v| v.as_str())
+    {
+        let normalized = effort.trim().to_ascii_lowercase();
+        if !matches!(
+            normalized.as_str(),
+            "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
+            return None; // unknown value — do not inject
+        }
+        let thinking_off = matches!(
+            body.pointer("/thinking/type").and_then(|t| t.as_str()),
+            None | Some("disabled")
+        );
+        return Some(if thinking_off {
+            "low".to_string()
+        } else {
+            normalized
+        });
+    }
+
+    resolve_thinking_fallback_effort(body).map(str::to_string)
+}
+
+/// effort 写入决策：是否写、写到哪个字段、写什么值、依据是什么。
+///
+/// - provider 声明 `supportsEffort: true` → 以 provider 为准（字段名与档位映射由
+///   配置决定），不再看模型名白名单；这是网关场景（映射后的上游模型名不在白名单
+///   里）唯一能拿到 effort 的路径。
+/// - provider 声明 `supportsEffort: false` → 明确不写，含白名单模型。
+/// - 未声明（None）→ 保持既有模型名白名单行为，逐字节不变。
+fn resolve_claude_chat_effort<'a>(
+    body: &Value,
+    model: &str,
+    config: Option<&'a ClaudeChatReasoningConfig>,
+) -> Option<(&'a str, String, &'static str)> {
+    match config.and_then(|config| config.supports_effort) {
+        Some(false) => None,
+        Some(true) => {
+            let requested = resolve_requested_effort_verbatim(body)?;
+            let mode = config.and_then(|config| config.effort_value_mode.as_deref());
+            let mapped = map_reasoning_effort(&requested, mode, None)?;
+            let param = config
+                .and_then(|config| config.effort_param.as_deref())
+                .filter(|param| !param.trim().is_empty())
+                .unwrap_or("reasoning_effort");
+            Some((param, mapped.to_string(), "provider"))
+        }
+        None => {
+            if !supports_reasoning_effort(model) {
+                return None;
+            }
+            let effort = resolve_reasoning_effort(body)?;
+            Some(("reasoning_effort", effort.to_string(), "model-whitelist"))
+        }
     }
 }
 
@@ -228,6 +300,16 @@ pub fn anthropic_to_openai(body: Value) -> Result<Value, ProxyError> {
 pub fn anthropic_to_openai_with_reasoning_content(
     body: Value,
     preserve_reasoning_content: bool,
+) -> Result<Value, ProxyError> {
+    anthropic_to_openai_with_reasoning_content_and_effort(body, preserve_reasoning_content, None)
+}
+
+/// 同 [`anthropic_to_openai_with_reasoning_content`]，额外接收 provider 级推理能力
+/// 配置（`meta.claudeChatReasoning`）。配置为 `None` 时与旧函数逐字节等价。
+pub fn anthropic_to_openai_with_reasoning_content_and_effort(
+    body: Value,
+    preserve_reasoning_content: bool,
+    reasoning_config: Option<&ClaudeChatReasoningConfig>,
 ) -> Result<Value, ProxyError> {
     let mut result = json!({});
 
@@ -298,9 +380,42 @@ pub fn anthropic_to_openai_with_reasoning_content(
     }
 
     // Map Anthropic thinking → OpenAI reasoning_effort
-    if supports_reasoning_effort(model) {
-        if let Some(effort) = resolve_reasoning_effort(&body) {
-            result["reasoning_effort"] = json!(effort);
+    match resolve_claude_chat_effort(&body, model, reasoning_config) {
+        Some((param, value, source)) => {
+            log::info!(
+                "[Claude] reasoning_effort: {param}={value} (model={model}, source={source})"
+            );
+            if param == "reasoning.effort" {
+                // OpenRouter 原生归一化对象：由上游翻译成各底层模型的正确推理参数
+                // （与 Codex 路径同一方言）。本转换从空对象构造，不会出现
+                // `reasoning` 与 `reasoning_effort` 并存触发 400 的情况。
+                result["reasoning"] = json!({ "effort": value });
+            } else {
+                result[param] = json!(value);
+            }
+        }
+        None => {
+            // 网关场景下上游模型名不在白名单，客户端 effort 会被静默丢弃。这里留一条
+            // debug 线索（不升 info：主会话每个请求都带 output_config.effort，会刷屏）。
+            let declared_off = reasoning_config
+                .and_then(|config| config.supports_effort)
+                .is_some_and(|supports| !supports);
+            let whitelist_blocked = reasoning_config
+                .and_then(|config| config.supports_effort)
+                .is_none()
+                && !supports_reasoning_effort(model);
+            if declared_off || whitelist_blocked {
+                if let Some(requested) = resolve_requested_effort_verbatim(&body) {
+                    let reason = if declared_off {
+                        "provider declares no effort support"
+                    } else {
+                        "model not in whitelist; set meta.claudeChatReasoning to forward it"
+                    };
+                    log::debug!(
+                        "[Claude] reasoning_effort not sent: requested={requested} model={model} (reason={reason})"
+                    );
+                }
+            }
         }
     }
 
@@ -2266,6 +2381,146 @@ mod tests {
 
         let result = anthropic_to_openai(input).unwrap();
         assert_eq!(result["reasoning_effort"], "medium");
+    }
+
+    // ── Provider 级推理声明（meta.claudeChatReasoning）──
+
+    #[test]
+    fn test_gateway_model_without_provider_config_drops_effort() {
+        // 现状基线（文档问题三）：转换层看到的是映射后的上游模型名，
+        // 不在白名单里 → 客户端 effort 被静默丢弃。
+        let input = json!({
+            "model": "deepseek-v4.1-flash",
+            "max_tokens": 1024,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+        assert!(result.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_provider_reasoning_config_forwards_effort_for_gateway_model() {
+        // provider 声明 supportsEffort 后，网关背后的 deepseek 模型也能拿到 effort，
+        // 且 passthrough（缺省）保留 max，不降级。
+        let input = json!({
+            "model": "deepseek-v4.1-flash",
+            "max_tokens": 1024,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let config = ClaudeChatReasoningConfig {
+            supports_effort: Some(true),
+            effort_param: None,
+            effort_value_mode: None,
+        };
+
+        let result =
+            anthropic_to_openai_with_reasoning_content_and_effort(input, false, Some(&config))
+                .unwrap();
+        assert_eq!(result["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn test_provider_reasoning_config_deepseek_mode_maps_tiers() {
+        let make_input = |effort: &str| {
+            json!({
+                "model": "deepseek-v4.1-flash",
+                "max_tokens": 1024,
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": effort},
+                "messages": [{"role": "user", "content": "Hello"}]
+            })
+        };
+        let config = ClaudeChatReasoningConfig {
+            supports_effort: Some(true),
+            effort_param: None,
+            effort_value_mode: Some("deepseek".to_string()),
+        };
+
+        let low = anthropic_to_openai_with_reasoning_content_and_effort(
+            make_input("low"),
+            false,
+            Some(&config),
+        )
+        .unwrap();
+        assert_eq!(low["reasoning_effort"], "high");
+
+        let max = anthropic_to_openai_with_reasoning_content_and_effort(
+            make_input("max"),
+            false,
+            Some(&config),
+        )
+        .unwrap();
+        assert_eq!(max["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn test_provider_reasoning_config_nested_dialect_writes_reasoning_object() {
+        let input = json!({
+            "model": "deepseek-v4.1-flash",
+            "max_tokens": 1024,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let config = ClaudeChatReasoningConfig {
+            supports_effort: Some(true),
+            effort_param: Some("reasoning.effort".to_string()),
+            effort_value_mode: None,
+        };
+
+        let result =
+            anthropic_to_openai_with_reasoning_content_and_effort(input, false, Some(&config))
+                .unwrap();
+        assert_eq!(result["reasoning"]["effort"], "high");
+        assert!(result.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_provider_reasoning_config_disabled_suppresses_whitelisted_model() {
+        // supportsEffort=false 是明确关闸：连白名单模型也不写。
+        let input = json!({
+            "model": "gpt-5.4",
+            "max_tokens": 1024,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let config = ClaudeChatReasoningConfig {
+            supports_effort: Some(false),
+            effort_param: None,
+            effort_value_mode: None,
+        };
+
+        let result =
+            anthropic_to_openai_with_reasoning_content_and_effort(input, false, Some(&config))
+                .unwrap();
+        assert!(result.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_provider_reasoning_config_unknown_effort_not_injected() {
+        let input = json!({
+            "model": "deepseek-v4.1-flash",
+            "max_tokens": 1024,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "turbo"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let config = ClaudeChatReasoningConfig {
+            supports_effort: Some(true),
+            effort_param: None,
+            effort_value_mode: None,
+        };
+
+        let result =
+            anthropic_to_openai_with_reasoning_content_and_effort(input, false, Some(&config))
+                .unwrap();
+        assert!(result.get("reasoning_effort").is_none());
     }
 
     #[test]

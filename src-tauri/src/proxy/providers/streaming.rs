@@ -263,6 +263,10 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         let mut inline_think = InlineThinkSplitter::default();
         let mut tool_blocks_by_index: HashMap<usize, ToolBlockState> = HashMap::new();
         let mut open_tool_block_indices: HashSet<u32> = HashSet::new();
+        // 本轮是否发过 tool_use 块。工具块在 finish_reason 边界被关掉并清空
+        // open_tool_block_indices，之后（[DONE] 边界、stop_reason 纠正）仍需知道
+        // "这轮有工具调用"，故单独记一个不复位的标志。
+        let mut has_emitted_tool_block = false;
 
         tokio::pin!(stream);
 
@@ -312,13 +316,22 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                     }
 
                                     // 流正常结束，发出缓存的 message_delta（含完整 usage）。
-                                    if let Some((stop_reason, usage_json)) = pending_message_delta.take() {
-                                        let event = build_message_delta_event(stop_reason, usage_json);
-                                        let sse_data = format!("event: message_delta\ndata: {}\n\n",
-                                            serde_json::to_string(&event).unwrap_or_default());
-                                        log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_delta (from pending)");
-                                        yield Ok(Bytes::from(sse_data));
-                                    }
+                                    // 上游只发 [DONE]、从不给 finish_reason（或只发空串，已被
+                                    // 过滤）时缓存为空：块已在上一步补关，终止事件不能缺席，
+                                    // 否则客户端拿不到 stop_reason（有工具块时更会以为这轮
+                                    // 无事发生，agent 循环直接停住）。
+                                    let (stop_reason, usage_json) = match pending_message_delta.take() {
+                                        Some(pending) => pending,
+                                        None => (
+                                            Some(fallback_stop_reason(has_emitted_tool_block)),
+                                            latest_usage.clone(),
+                                        ),
+                                    };
+                                    let event = build_message_delta_event(stop_reason, usage_json);
+                                    let sse_data = format!("event: message_delta\ndata: {}\n\n",
+                                        serde_json::to_string(&event).unwrap_or_default());
+                                    log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_delta (from pending)");
+                                    yield Ok(Bytes::from(sse_data));
 
                                     let event = json!({"type": "message_stop"});
                                     let sse_data = format!("event: message_stop\ndata: {}\n\n",
@@ -576,6 +589,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                             serde_json::to_string(&event).unwrap_or_default());
                                                         yield Ok(Bytes::from(sse_data));
                                                         open_tool_block_indices.insert(anthropic_index);
+                                                        has_emitted_tool_block = true;
                                                     }
 
                                                     if let Some(args) = pending_after_start {
@@ -613,7 +627,16 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                         // 注意：OpenRouter 某些 provider 会发送多个带 finish_reason 的 chunk
                                         // （第一个 usage 为 null，后续才补全）。此处只做缓存，不立即发送，
                                         // 等到 [DONE] 或流末尾再统一发出，确保 usage 完整且只发一次。
-                                        if let Some(finish_reason) = &choice.finish_reason {
+                                        // 空串 finish_reason（部分中转在每个 chunk 里都带 `""`）不是
+                                        // 结束信号：当作缺失处理。否则第一个空串就会把 latch 置位、
+                                        // 把 stop_reason 锁死成 end_turn，并让后续每个 chunk 都刷一条
+                                        // Unknown finish_reason 警告。
+                                        let finish_reason = choice
+                                            .finish_reason
+                                            .as_deref()
+                                            .map(str::trim)
+                                            .filter(|reason| !reason.is_empty());
+                                        if let Some(finish_reason) = finish_reason {
                                             let stop_reason = map_stop_reason(Some(finish_reason));
                                             let usage_json =
                                                 chunk_usage_json.clone().or_else(|| latest_usage.clone());
@@ -704,6 +727,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                     serde_json::to_string(&event).unwrap_or_default());
                                                 yield Ok(Bytes::from(sse_data));
                                                 open_tool_block_indices.insert(index);
+                                                has_emitted_tool_block = true;
                                                 if !pending.is_empty() {
                                                     let delta_event = json!({
                                                         "type": "content_block_delta",
@@ -735,6 +759,14 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                                 open_tool_block_indices.clear();
                                             }
 
+                                            // 本轮已经发过 tool_use 块却报 end_turn 是自相矛盾的
+                                            // （网关发空串 / 错误 stop 时常见），以工具块为准；其它
+                                            // 终止语义（如 max_tokens 截断）保留，避免 CC 去执行
+                                            // 一个不完整的工具调用。
+                                            let stop_reason = correct_stop_reason_for_tool_blocks(
+                                                stop_reason,
+                                                has_emitted_tool_block,
+                                            );
                                             // 缓存 message_delta，等到 [DONE] 时发送（以便收集完整的 usage）
                                             pending_message_delta = Some((stop_reason, usage_json));
                                         }
@@ -863,6 +895,29 @@ fn extract_cache_write_tokens(usage: &Usage) -> Option<u32> {
 }
 
 /// 映射停止原因
+/// [DONE] 边界没有缓存的终止事件时，按本轮是否发过工具块推导 stop_reason：
+/// 有工具块说明这轮有活要干，报 end_turn 会让 agent 循环停住。
+fn fallback_stop_reason(has_tool_block: bool) -> String {
+    if has_tool_block {
+        "tool_use".to_string()
+    } else {
+        "end_turn".to_string()
+    }
+}
+
+/// 本轮发过工具块却报 end_turn 时以工具块为准（网关发空串 / 错误 stop 的常见形状）；
+/// 其它终止语义（如 max_tokens 截断）原样保留，避免客户端执行不完整的工具调用。
+fn correct_stop_reason_for_tool_blocks(
+    stop_reason: Option<String>,
+    has_tool_block: bool,
+) -> Option<String> {
+    if has_tool_block && stop_reason.as_deref() == Some("end_turn") {
+        Some("tool_use".to_string())
+    } else {
+        stop_reason
+    }
+}
+
 fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
     finish_reason.map(|r| {
         match r {
@@ -2166,5 +2221,90 @@ mod tests {
         )
         .await
         .expect("a terminal response must not await another upstream chunk");
+    }
+
+    #[tokio::test]
+    async fn test_empty_finish_reason_is_ignored_and_later_value_applies() {
+        // 中转在正文 chunk 里夹带 `finish_reason: ""`：空串必须被当作缺失，否则第一个
+        // 空串就把 latch 置位、把 stop_reason 锁死成 end_turn，后续真实值不再生效。
+        let input = concat!(
+            "data: {\"id\":\"c\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"\"}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"\"}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+
+        let boundaries = block_boundaries(&events);
+        let starts = boundaries.iter().filter(|b| b.starts_with("start:")).count();
+        let stops = boundaries.iter().filter(|b| b.starts_with("stop:")).count();
+        assert_eq!(starts, stops, "每个 start 都要有配对 stop: {boundaries:?}");
+        assert!(boundaries.iter().any(|b| b.ends_with(":tool_use")));
+
+        let message_deltas: Vec<&Value> = events
+            .iter()
+            .filter(|event| event_type(event) == Some("message_delta"))
+            .collect();
+        assert_eq!(message_deltas.len(), 1, "空串不应触发额外的 message_delta");
+        assert_eq!(message_deltas[0]["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[tokio::test]
+    async fn test_only_empty_finish_reason_still_reports_tool_use_at_done() {
+        // 上游只发空串、从不给真实 finish_reason：过滤后缓存为空，[DONE] 边界必须
+        // 补一条 message_delta，且本轮发过工具块时报 tool_use。
+        let input = concat!(
+            "data: {\"id\":\"c\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]},\"finish_reason\":\"\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+
+        let boundaries = block_boundaries(&events);
+        assert!(boundaries.iter().any(|b| b.ends_with(":tool_use")));
+        let message_delta = events
+            .iter()
+            .find(|event| event_type(event) == Some("message_delta"))
+            .expect("空串 finish_reason 不能吞掉终止 message_delta");
+        assert_eq!(message_delta["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[tokio::test]
+    async fn test_end_turn_with_tool_blocks_is_corrected_to_tool_use() {
+        // 有工具块却报 end_turn 自相矛盾（网关错误 stop 的常见形状）：以工具块为准，
+        // 否则 CC 不会执行这一轮的工具调用。
+        let input = concat!(
+            "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+
+        let message_delta = events
+            .iter()
+            .find(|event| event_type(event) == Some("message_delta"))
+            .expect("should emit message_delta");
+        assert_eq!(message_delta["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[tokio::test]
+    async fn test_truncated_tool_call_keeps_max_tokens_stop_reason() {
+        // 截断语义优先：不能因为出现过工具块就把 max_tokens 改成 tool_use，
+        // 否则 CC 会去执行一个参数不完整的工具调用。
+        let input = concat!(
+            "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"cmd\\\":\"}}]}}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+
+        let message_delta = events
+            .iter()
+            .find(|event| event_type(event) == Some("message_delta"))
+            .expect("should emit message_delta");
+        assert_eq!(message_delta["delta"]["stop_reason"], "max_tokens");
     }
 }

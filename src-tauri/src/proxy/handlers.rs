@@ -8,6 +8,7 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
+    classifier_shortcut,
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::{ActiveConnectionGuard, CodexUpstreamFormat},
@@ -352,6 +353,40 @@ async fn handle_messages_for_app(
         .get("stream")
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
+
+    // auto mode 分类器短路：命中判定请求形状且 provider 打开开关时本地回复，不转发
+    // 上游（重试风暴的根因与判定条件见 proxy::classifier_shortcut 模块文档）。
+    // 只处理 Claude Code 的判定请求；Claude Desktop 不会发这类请求。
+    if matches!(app_type, AppType::Claude) {
+        if let Some(config) = ctx
+            .provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.claude_classifier_shortcut.as_ref())
+        {
+            if classifier_shortcut::is_classifier_request(&body, config) {
+                let reply = classifier_shortcut::reply_text(config);
+                let reply_body = classifier_shortcut::build_reply(
+                    body.get("model").and_then(Value::as_str).unwrap_or_default(),
+                    reply,
+                    &classifier_shortcut::request_text(&body),
+                );
+                log::info!(
+                    "[Claude] auto mode classifier request answered locally \
+                     (provider={}, reply={reply})",
+                    ctx.provider.name
+                );
+                return Ok((StatusCode::OK, Json(reply_body)).into_response());
+            }
+            if is_stream && classifier_shortcut::matches_classifier_markers(&body, config) {
+                // 分类器恒为非流式（抓包证据）；形状若变了，别让它静默失效。
+                log::warn!(
+                    "[Claude] classifier-shaped request arrived with stream=true; \
+                     forwarding upstream (shortcut only handles non-streaming requests)"
+                );
+            }
+        }
+    }
 
     // 转发请求
     let forwarder = ctx.create_forwarder(&state);
