@@ -367,7 +367,9 @@ async fn handle_messages_for_app(
             if classifier_shortcut::is_classifier_request(&body, config) {
                 let reply = classifier_shortcut::reply_text(config);
                 let reply_body = classifier_shortcut::build_reply(
-                    body.get("model").and_then(Value::as_str).unwrap_or_default(),
+                    body.get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
                     reply,
                     &classifier_shortcut::request_text(&body),
                 );

@@ -2237,7 +2237,10 @@ mod tests {
         let events = collect_anthropic_events(input).await;
 
         let boundaries = block_boundaries(&events);
-        let starts = boundaries.iter().filter(|b| b.starts_with("start:")).count();
+        let starts = boundaries
+            .iter()
+            .filter(|b| b.starts_with("start:"))
+            .count();
         let stops = boundaries.iter().filter(|b| b.starts_with("stop:")).count();
         assert_eq!(starts, stops, "每个 start 都要有配对 stop: {boundaries:?}");
         assert!(boundaries.iter().any(|b| b.ends_with(":tool_use")));

@@ -94,7 +94,11 @@ pub fn is_classifier_request(body: &Value, config: &ClaudeClassifierShortcutConf
 /// 调用方可用它在流式请求上单独判一次并记警告：分类器恒为非流式，形状若变了，
 /// 这条日志能让"功能静默失效"变得可见。
 pub fn matches_classifier_markers(body: &Value, config: &ClaudeClassifierShortcutConfig) -> bool {
-    if body.get("tools").and_then(Value::as_array).is_some_and(|tools| !tools.is_empty()) {
+    if body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+    {
         return false;
     }
     if body.pointer("/thinking/type").and_then(Value::as_str) != Some("disabled") {
