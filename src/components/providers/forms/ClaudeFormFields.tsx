@@ -11,6 +11,7 @@ import { toast } from "@/lib/toast";
 import { Checkbox } from "@/components/ui/checkbox";
 import { FormLabel } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -61,6 +62,9 @@ import type {
   ProviderCategory,
   ClaudeApiFormat,
   ClaudeApiKeyField,
+  ClaudeChatReasoning,
+  ClaudeChatEffortValueMode,
+  ClaudeClassifierShortcut,
 } from "@/types";
 import type { ManagedAuthProvider } from "@/lib/api";
 import {
@@ -169,6 +173,13 @@ interface ClaudeFormFieldsProps {
   localProxyBodyOverride: string;
   onLocalProxyBodyOverrideChange: (value: string) => void;
 
+  // Claude → OpenAI Chat 推理能力声明（meta.claudeChatReasoning）
+  claudeChatReasoning?: ClaudeChatReasoning;
+  onClaudeChatReasoningChange?: (value: ClaudeChatReasoning) => void;
+  // auto mode 分类器本地短路（meta.claudeClassifierShortcut）
+  claudeClassifierShortcut?: ClaudeClassifierShortcut;
+  onClaudeClassifierShortcutChange?: (value: ClaudeClassifierShortcut) => void;
+
   /**
    * 布局：`classic` 是直连 / 路由用的完整表单；`stack` 是 Stack 模式的简化面板（连接 +
    * 模型列表 + 高级），不显示模型映射。
@@ -245,6 +256,10 @@ export function ClaudeFormFields({
   onLocalProxyHeadersOverrideChange,
   localProxyBodyOverride,
   onLocalProxyBodyOverrideChange,
+  claudeChatReasoning,
+  onClaudeChatReasoningChange,
+  claudeClassifierShortcut,
+  onClaudeClassifierShortcutChange,
   variant = "classic",
   directModeFormatNotice,
   stackModelRows = [],
@@ -1335,6 +1350,127 @@ export function ClaudeFormFields({
                 </p>
               )}
             </div>
+
+            {/* 网关场景的推理强度与 auto mode 分类器：模型名被映射成上游模型后，
+                内置白名单匹配不上，这两项需要显式声明。 */}
+            {(onClaudeChatReasoningChange ||
+              onClaudeClassifierShortcutChange) && (
+              <div className="space-y-3 border-t border-border pt-4">
+                {apiFormat === "openai_chat" && onClaudeChatReasoningChange && (
+                  <div className="space-y-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-center gap-0.5">
+                        <FormLabel>
+                          {t("claudeConfig.effortToggle", {
+                            defaultValue: "转发思考强度",
+                          })}
+                        </FormLabel>
+                        <HelpTip
+                          title={t("claudeConfig.effortToggle", {
+                            defaultValue: "转发思考强度",
+                          })}
+                        >
+                          {t("claudeConfig.effortHint", {
+                            defaultValue:
+                              "打开后把客户端 /effort 的档位写进上游请求（默认 reasoning_effort）；不打开时沿用内置模型名白名单，网关映射出的模型名（如 deepseek-*）匹配不上，effort 会被静默丢弃。",
+                          })}
+                        </HelpTip>
+                      </div>
+                      <Switch
+                        checked={claudeChatReasoning?.supportsEffort ?? false}
+                        onCheckedChange={(checked) =>
+                          onClaudeChatReasoningChange({
+                            ...claudeChatReasoning,
+                            supportsEffort: checked,
+                          })
+                        }
+                        aria-label={t("claudeConfig.effortToggle", {
+                          defaultValue: "转发思考强度",
+                        })}
+                      />
+                    </div>
+                    {claudeChatReasoning?.supportsEffort && (
+                      <div className="space-y-1">
+                        <FormLabel>
+                          {t("claudeConfig.effortValueModeLabel", {
+                            defaultValue: "档位映射方式",
+                          })}
+                        </FormLabel>
+                        <Select
+                          value={
+                            claudeChatReasoning?.effortValueMode ??
+                            "passthrough"
+                          }
+                          onValueChange={(value) =>
+                            onClaudeChatReasoningChange({
+                              ...claudeChatReasoning,
+                              effortValueMode:
+                                value as ClaudeChatEffortValueMode,
+                            })
+                          }
+                        >
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="passthrough">
+                              {t("claudeConfig.effortValueModePassthrough", {
+                                defaultValue: "原样透传（保留 max）",
+                              })}
+                            </SelectItem>
+                            <SelectItem value="deepseek">
+                              {t("claudeConfig.effortValueModeDeepseek", {
+                                defaultValue:
+                                  "DeepSeek（max/xhigh → max，其余 → high）",
+                              })}
+                            </SelectItem>
+                            <SelectItem value="low_high">
+                              {t("claudeConfig.effortValueModeLowHigh", {
+                                defaultValue: "只分低/高两档",
+                              })}
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {onClaudeClassifierShortcutChange && (
+                  <div className="flex items-start justify-between gap-3 border-t border-border pt-3">
+                    <div className="flex items-center gap-0.5">
+                      <FormLabel>
+                        {t("claudeConfig.classifierToggle", {
+                          defaultValue: "auto mode 判定本地放行",
+                        })}
+                      </FormLabel>
+                      <HelpTip
+                        title={t("claudeConfig.classifierToggle", {
+                          defaultValue: "auto mode 判定本地放行",
+                        })}
+                      >
+                        {t("claudeConfig.classifierHint", {
+                          defaultValue:
+                            "命中 Claude Code auto mode 的命令判定请求时，直接本地回复 <block>no</block>（放行），不再转发上游：上游是推理模型时，64 token 会被思考吃光，CC 要重试 6 次才拿到判定。跳过的是命令安全判定，Claude Code 自己的 permissions.allow 规则仍然生效。",
+                        })}
+                      </HelpTip>
+                    </div>
+                    <Switch
+                      checked={claudeClassifierShortcut?.enabled ?? false}
+                      onCheckedChange={(checked) =>
+                        onClaudeClassifierShortcutChange({
+                          ...claudeClassifierShortcut,
+                          enabled: checked,
+                        })
+                      }
+                      aria-label={t("claudeConfig.classifierToggle", {
+                        defaultValue: "auto mode 判定本地放行",
+                      })}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Copilot 的请求由转发层按 Copilot 客户端的样子发，UA 和请求覆盖都会被跳过 */}
             {!isCopilotPreset && (

@@ -28,6 +28,8 @@ import type {
   CodexCopilotApiFormat,
   CodexCatalogModel,
   CodexChatReasoning,
+  ClaudeChatReasoning,
+  ClaudeClassifierShortcut,
   PromptCacheRoutingMode,
   ClaudeApiKeyField,
 } from "@/types";
@@ -250,6 +252,36 @@ const normalizeCodexChatReasoningForSave = (
 const normalizeProviderKey = (value: string) =>
   value.toLowerCase().replace(/[^a-z0-9-]/g, "");
 
+/** Claude → Chat 推理声明：只在显式打开 effort 时落库，否则不写 meta。 */
+const normalizeClaudeChatReasoningForSave = (
+  value?: ClaudeChatReasoning,
+): ClaudeChatReasoning | undefined => {
+  if (value?.supportsEffort !== true) {
+    return undefined;
+  }
+  const effortParam = value.effortParam?.trim();
+  return {
+    supportsEffort: true,
+    ...(effortParam ? { effortParam } : {}),
+    effortValueMode: value.effortValueMode ?? "passthrough",
+  };
+};
+
+/** auto mode 分类器短路：只在显式打开时落库。 */
+const normalizeClaudeClassifierShortcutForSave = (
+  value?: ClaudeClassifierShortcut,
+): ClaudeClassifierShortcut | undefined => {
+  if (value?.enabled !== true) {
+    return undefined;
+  }
+  const reply = value.reply?.trim();
+  return {
+    enabled: true,
+    ...(value.patterns?.length ? { patterns: value.patterns } : {}),
+    ...(reply ? { reply } : {}),
+  };
+};
+
 /**
  * 表单里的 Stack 模型列表：行里配了就用它（空列表是用户清空了），没配是 `null`（跟着模型
  * 映射）。
@@ -435,6 +467,10 @@ function ProviderFormFull({
     setHasValidCodexOfficialSelection(true);
     setCodexFastMode(initialData?.meta?.codexFastMode ?? false);
     setCodexChatReasoning(initialData?.meta?.codexChatReasoning ?? {});
+    setClaudeChatReasoning(initialData?.meta?.claudeChatReasoning ?? {});
+    setClaudeClassifierShortcut(
+      initialData?.meta?.claudeClassifierShortcut ?? {},
+    );
     setPromptCacheRouting(initialData?.meta?.promptCacheRouting ?? "auto");
     setCustomUserAgent(initialData?.meta?.customUserAgent ?? "");
     setLocalProxyHeadersOverride(
@@ -641,6 +677,14 @@ function ProviderFormFull({
   const [codexChatReasoning, setCodexChatReasoning] =
     useState<CodexChatReasoning>(
       () => initialData?.meta?.codexChatReasoning ?? {},
+    );
+  const [claudeChatReasoning, setClaudeChatReasoning] =
+    useState<ClaudeChatReasoning>(
+      () => initialData?.meta?.claudeChatReasoning ?? {},
+    );
+  const [claudeClassifierShortcut, setClaudeClassifierShortcut] =
+    useState<ClaudeClassifierShortcut>(
+      () => initialData?.meta?.claudeClassifierShortcut ?? {},
     );
   const [promptCacheRouting, setPromptCacheRouting] =
     useState<PromptCacheRoutingMode>(
@@ -1925,6 +1969,14 @@ function ProviderFormFull({
         appId === "codex" && category !== "official" && isCodexChatFormat
           ? normalizeCodexChatReasoningForSave(codexChatReasoning)
           : undefined,
+      claudeChatReasoning:
+        appId === "claude"
+          ? normalizeClaudeChatReasoningForSave(claudeChatReasoning)
+          : undefined,
+      claudeClassifierShortcut:
+        appId === "claude"
+          ? normalizeClaudeClassifierShortcutForSave(claudeClassifierShortcut)
+          : undefined,
       promptCacheRouting:
         appId === "codex" &&
         category !== "official" &&
@@ -2620,6 +2672,10 @@ function ProviderFormFull({
               onLocalProxyHeadersOverrideChange={setLocalProxyHeadersOverride}
               localProxyBodyOverride={localProxyBodyOverride}
               onLocalProxyBodyOverrideChange={setLocalProxyBodyOverride}
+              claudeChatReasoning={claudeChatReasoning}
+              onClaudeChatReasoningChange={setClaudeChatReasoning}
+              claudeClassifierShortcut={claudeClassifierShortcut}
+              onClaudeClassifierShortcutChange={setClaudeClassifierShortcut}
               variant={useStackLayout ? "stack" : "classic"}
               directModeFormatNotice={directModeFormatNotice}
               stackModelRows={shownClaudeStackRows}

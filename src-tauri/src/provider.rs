@@ -452,6 +452,51 @@ pub struct CodexChatReasoningConfig {
     pub effort_levels: Option<Vec<String>>,
 }
 
+/// Claude（Anthropic Messages）→ OpenAI Chat Completions 的 reasoning 能力描述。
+///
+/// Claude 路径原先只用 `supports_reasoning_effort(model)` 的模型名硬白名单决定是否
+/// 写 `reasoning_effort`。网关场景下转换层看到的是映射后的上游模型名（如
+/// `deepseek-v4.1-flash`），不在白名单里，客户端发来的 `output_config.effort`
+/// 会被静默丢弃，上游只能跑自己的默认档。声明本字段后以 provider 为准，不再依赖
+/// 模型名。未配置（None）时保持既有白名单行为不变。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ClaudeChatReasoningConfig {
+    /// 上游是否接受 effort 参数。Some(true) 走 provider 声明；Some(false) 明确不写
+    /// effort（连白名单模型也不写）；None 走既有模型名白名单。
+    #[serde(rename = "supportsEffort", skip_serializing_if = "Option::is_none")]
+    pub supports_effort: Option<bool>,
+    /// effort 字段名，缺省 `reasoning_effort`。`reasoning.effort` 写嵌套对象
+    /// （OpenRouter 方言，与 Codex 路径同义）；其它非空值按字面字段名平铺写入，
+    /// 供自定义网关使用。
+    #[serde(rename = "effortParam", skip_serializing_if = "Option::is_none")]
+    pub effort_param: Option<String>,
+    /// 档位映射方式：`passthrough`（缺省，原样透传，`max` 不被降级）/ `deepseek` /
+    /// `low_high`。取值语义与 Codex 路径的 `codexChatReasoning.effortValueMode` 一致。
+    #[serde(rename = "effortValueMode", skip_serializing_if = "Option::is_none")]
+    pub effort_value_mode: Option<String>,
+}
+
+/// Claude auto mode 分类器请求的本地短路配置。
+///
+/// Claude Code 的 auto mode 会对每条工具调用发一个非流式小请求（首次
+/// `max_tokens=64`、`thinking: disabled`、无 tools），让模型判定命令安全性，期望
+/// 输出 `<block>yes</block>`（阻止）/ `<block>no</block>`（放行）。推理型上游会把
+/// 64 token 全用在思考上，判定文本一个字符都出不来，CC 因此重试 5 次再把预算升到
+/// 8192。开启后命中的请求直接本地回复，不再转发。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ClaudeClassifierShortcutConfig {
+    /// 总开关，缺省关闭。
+    #[serde(rename = "enabled", skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// 识别分类器请求用的正则；为空时用内置默认模式
+    /// （见 `proxy::classifier_shortcut::DEFAULT_PATTERNS`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<String>,
+    /// 命中后直接回复的判定文本，缺省 `<block>no</block>`（放行）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
+}
+
 /// Local proxy request overrides applied after route/protocol transforms.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LocalProxyRequestOverrides {
@@ -557,6 +602,22 @@ pub struct ProviderMeta {
     /// Codex Responses -> Chat Completions reasoning capability metadata.
     #[serde(rename = "codexChatReasoning", skip_serializing_if = "Option::is_none")]
     pub codex_chat_reasoning: Option<CodexChatReasoningConfig>,
+    /// Claude Messages -> OpenAI Chat Completions reasoning capability metadata.
+    /// Replaces the model-name whitelist that silently dropped
+    /// `output_config.effort` on gateway-backed providers.
+    #[serde(
+        rename = "claudeChatReasoning",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub claude_chat_reasoning: Option<ClaudeChatReasoningConfig>,
+    /// Claude auto mode classifier short-circuit. When enabled, matching
+    /// non-streaming permission-judging requests are answered locally instead of
+    /// being forwarded upstream (see `proxy::classifier_shortcut`).
+    #[serde(
+        rename = "claudeClassifierShortcut",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub claude_classifier_shortcut: Option<ClaudeClassifierShortcutConfig>,
     /// Codex → Anthropic path: whether to emulate the Claude Code client
     /// (User-Agent / anthropic-beta / x-app + injecting the Claude Code system
     /// prompt first line). Disabled by default; only an explicit `true` enables it.

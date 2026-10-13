@@ -166,6 +166,26 @@ export interface CodexChatReasoning {
 
 export type PromptCacheRoutingMode = "auto" | "enabled" | "disabled";
 
+// Claude Messages -> OpenAI Chat Completions 的 effort 档位映射方式（与 Codex 路径同义）。
+export type ClaudeChatEffortValueMode = "passthrough" | "low_high" | "deepseek";
+
+export interface ClaudeChatReasoning {
+  // 上游是否接受 effort 参数。不设置时沿用模型名白名单（网关场景通常恒为 false）。
+  supportsEffort?: boolean;
+  // effort 字段名，缺省 reasoning_effort；reasoning.effort 写嵌套对象（OpenRouter 方言）。
+  effortParam?: string;
+  effortValueMode?: ClaudeChatEffortValueMode;
+}
+
+// Claude Code auto mode 分类器请求的本地短路配置。
+export interface ClaudeClassifierShortcut {
+  enabled?: boolean;
+  // 识别用的正则；留空用内置默认（<transcript> + Err on the side of blocking）。
+  patterns?: string[];
+  // 命中后回复的判定文本，缺省 <block>no</block>（放行）。
+  reply?: string;
+}
+
 export interface LocalProxyRequestOverrides {
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
@@ -217,6 +237,13 @@ export interface ProviderMeta {
   codexFastMode?: boolean;
   // Codex Responses -> Chat Completions reasoning capability metadata
   codexChatReasoning?: CodexChatReasoning;
+  // Claude Messages -> OpenAI Chat Completions reasoning capability metadata.
+  // Declaring supportsEffort makes the proxy forward output_config.effort instead of
+  // relying on the model-name whitelist (which never matches gateway-mapped models).
+  claudeChatReasoning?: ClaudeChatReasoning;
+  // Claude Code auto mode classifier short-circuit: answer permission-judging
+  // requests locally instead of forwarding them upstream.
+  claudeClassifierShortcut?: ClaudeClassifierShortcut;
   // Codex → Anthropic path: emulate the Claude Code client (disabled by default; only an explicit true enables it)
   impersonateClaudeCode?: boolean;
   // Codex → Anthropic path: override the Anthropic max_tokens (output ceiling).

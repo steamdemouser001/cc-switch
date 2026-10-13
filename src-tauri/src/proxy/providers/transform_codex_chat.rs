@@ -473,7 +473,9 @@ fn reasoning_requested(body: &Value) -> Option<bool> {
     body.get("reasoning").map(|value| !value.is_null())
 }
 
-fn map_reasoning_effort<'a>(
+/// 把客户端请求的档位映射成上游接受的枚举。Claude → Chat 路径（`transform.rs`）
+/// 复用本函数，两边的档位语义必须保持一致。
+pub(crate) fn map_reasoning_effort<'a>(
     effort: &str,
     mode: Option<&str>,
     effort_levels: Option<&'a [String]>,
